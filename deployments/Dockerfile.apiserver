@@ -1,0 +1,20 @@
+# ビルド用のステージ
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /app
+# 依存関係を先にコピーしてダウンロード（キャッシュ効率化）
+COPY go.mod go.sum ./
+RUN go mod download
+
+# ソースコードをコピーしてビルド
+COPY . .
+# CGOを無効化してAlpine環境でも動く完全な静的バイナリを作成
+RUN CGO_ENABLED=0 GOOS=linux go build -o apiserver ./cmd/apiserver
+
+# 実行用の軽量ステージ
+FROM alpine:latest
+WORKDIR /app
+COPY --from=builder /app/apiserver .
+
+EXPOSE 8080
+CMD ["./apiserver"]
