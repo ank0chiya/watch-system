@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  # --- Service Discovery ---
+  consul:
+    image: hashicorp/consul:1.15
+    container_name: consul-server
+    restart: always
+    volumes:
+      - consul_data:/consul/data
+    ports:
+      - "8500:8500"      # Web UI
+      - "8600:8600/udp"  # DNS interface
+    command: "agent -server -bootstrap-expect=1 -ui -client=0.0.0.0"
+
+  # --- Persistence Layer ---
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  # --- Buffer & HA Layer (Redis) ---
+  redis-master:
+    image: redis:7-alpine
+    container_name: redis-master
+    restart: always
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+
+  redis-replica:
+    image: redis:7-alpine
+    container_name: redis-replica
+    restart: always
+    command: redis-server --replicaof redis-master 6379 --appendonly yes
+    depends_on:
+      - redis-master
+
+  redis-sentinel:
+    image: redis:7-alpine
+    container_name: redis-sentinel
+    restart: always
+    volumes:
+      # 一旦 /tmp に読み取り専用(ro)でマウントする
+      - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
+    # 書き込み可能な /etc にコピーしてから実行するようコマンドを変更
+    command: sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf && redis-sentinel /etc/sentinel.conf"
+    depends_on:
+      - redis-master
+      - redis-replica
+    ports:
+      - "26379:26379"
+
+volumes:
+  consul_data:
+  mongo_data:
