@@ -1,10 +1,10 @@
-version: '3.8'
-
 services:
   # --- Service Discovery ---
   consul:
     image: hashicorp/consul:1.15
     container_name: consul-server
+    networks:
+      - watch-net
     restart: always
     volumes:
       - consul_data:/consul/data
@@ -17,6 +17,8 @@ services:
   mongodb:
     image: mongo:latest
     container_name: mongodb
+    networks:
+      - watch-net
     restart: always
     ports:
       - "27017:27017"
@@ -27,6 +29,8 @@ services:
   redis-master:
     image: redis:7-alpine
     container_name: redis-master
+    networks:
+      - watch-net
     restart: always
     command: redis-server --appendonly yes
     ports:
@@ -35,6 +39,8 @@ services:
   redis-replica:
     image: redis:7-alpine
     container_name: redis-replica
+    networks:
+      - watch-net
     restart: always
     command: redis-server --replicaof redis-master 6379 --appendonly yes
     depends_on:
@@ -43,6 +49,8 @@ services:
   redis-sentinel:
     image: redis:7-alpine
     container_name: redis-sentinel
+    networks:
+      - watch-net
     restart: always
     volumes:
       # 一旦 /tmp に読み取り専用(ro)でマウントする
@@ -60,6 +68,8 @@ services:
       context: ../
       dockerfile: deployments/Dockerfile.apiserver
     container_name: apiserver
+    networks:
+      - watch-net
     restart: always
     ports:
       - "8080:8080"
@@ -73,7 +83,27 @@ services:
     depends_on:
       - consul
       - redis-sentinel
+  
+  agent:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.agent
+    container_name: agent
+    networks:
+      - watch-net
+    environment:
+      - CONSUL_ADDR=consul:8500
+      - COLLECT_INTERVAL=5s
+    depends_on:
+      - consul
+      - apiserver
+    # ★重要: コンテナの中からホストマシンのリソース（CPU/メモリ）を取得するための設定
+    pid: "host"
 
 volumes:
   consul_data:
   mongo_data:
+
+networks:
+  watch-net:
+    driver: bridge
