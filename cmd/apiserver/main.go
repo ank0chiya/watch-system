@@ -16,6 +16,7 @@ import (
 )
 
 type MetricPayload struct {
+	TenantID    string  `json:"tenant_id"`
 	HostID      string  `json:"host_id"`
 	CPUUsage    float64 `json:"cpu_usage"`
 	MemoryUsage float64 `json:"memory_usage"`

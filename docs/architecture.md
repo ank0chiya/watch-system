@@ -9,16 +9,21 @@
 ```mermaid
 graph TD
     subgraph "Data Collection Layer"
-        Agent1[Go Agent 1<br/>CPU/Memory Collector]
-        Agent2[Go Agent N<br/>CPU/Memory Collector]
+        Agent1[Go Agent 1<br/>Tenant: tenant-1]
+        Agent2[Go Agent N<br/>Tenant: tenant-N]
     end
 
     subgraph "Service Discovery & Registry"
         Consul((Consul Server))
     end
 
-    subgraph "API & Processing Layer"
+    subgraph "API & Configuration Layer"
         API[Go API Server<br/>HTTP Handler]
+        ConfigMgr[Go Config Manager<br/>Config API]
+    end
+
+    subgraph "Processing & Analysis Layer"
+        Analyzer[Go Analyzer<br/>Pull & Threshold Check]
         Worker[Go Background Worker<br/>Goroutine]
     end
 
@@ -33,58 +38,65 @@ graph TD
     end
 
     %% Agent Flow
-    Agent1 -. "1. DNS Query<br/>(Find API)" .-> Consul
-    Agent1 == "2. POST JSON<br/>/api/v1/metrics" === API
+    Agent1 -. "1. Query API Addr" .-> Consul
+    Agent1 == "2. POST /api/v1/metrics" === API
     
     %% API Flow
-    API -. "3. Register Self &<br/>Query DBs" .-> Consul
-    API == "4. Fast Queueing<br/>(XADD)" === RedisM
+    API == "3. XADD (Queue)" === RedisM
     
-    %% Worker Flow
-    Worker == "5. Fetch Stream<br/>(XREADGROUP)" === RedisM
-    Worker == "6. Bulk Insert" === Mongo
+    %% Config Flow
+    User([Operator / Admin]) == "4. POST /api/v1/config/analyzer/{tenant_id}" === ConfigMgr
+    ConfigMgr == "5. Save Config" === Mongo
     
-    %% Health Checks & HA
-    Consul -. "Health Checks" .- Agent1
-    Consul -. "Health Checks" .- API
-    Consul -. "Health Checks" .- RedisM
-    Consul -. "Health Checks" .- Mongo
-    
-    Sentinel -. "Monitor &<br/>Failover" .- RedisM
-    Sentinel -. "Monitor" .- RedisR
-    RedisM -. "Replication" .-> RedisR
+    %% Analyzer Flow
+    Analyzer -. "6. GET /api/v1/config/analyzer/{tenant_id}" .-> ConfigMgr
+    Analyzer == "7. XREADGROUP (Pull)" === RedisM
+    Analyzer == "8. Get/Set state:hosts" === RedisM
+    Analyzer -. "9. Log Alert/Recovery" .-> Console([Console Log])
 ```
 
 ## 3. コンポーネント定義と役割
 
 ### 3.1 メトリクス収集エージェント (Go Application)
 * **役割:** 各監視対象サーバーに常駐し、定期的にシステムリソース（CPU/メモリ利用率）を収集する。
-* **動作:** 起動時にConsulのDNS機能を利用してAPIサーバーのエンドポイントを解決する。収集したデータはJSON形式でAPIサーバーへPOST送信する。
-* **拡張性:** Collectorインターフェースを実装しており、将来的なPingやHTTP死活監視の追加が容易な構造。
+* **動作:** 起動時に環境変数からテナントID (`tenant_id`) を読み込む。ConsulのDNS機能（またはヘルスチェックAPI）を利用してAPIサーバーのエンドポイントを解決する。収集したデータは、テナントIDを含めてJSON形式でAPIサーバーへPOST送信する。
 
 ### 3.2 APIサーバー / アグリゲーター (Go Application)
-* **役割:** エージェントからの大量のHTTPリクエストを受け止め、一時バッファへの書き込みと、永続化ストレージへのバッチ処理を担う。
-* **動作 (HTTP層):** リクエストを受信後、即座にRedis Streamsに対してデータの書き込み(`XADD`)を行い、HTTP `200 OK` を返す（高速応答）。
-* **動作 (Worker層):** メイン処理とは別のGoroutineで稼働。Redis Streamから未処理のデータを取得(`XREADGROUP`)し、MongoDBへ定期的に一括登録（Bulk Insert）を行う。完了後、RedisへACKを返す。
+* **役割:** エージェントからの大量のHTTPリクエストを受け止め、一時バッファ（Redis Streams）への高速な書き込みを担う。
+* **動作:** リクエストを受信後、即座にRedis Streamsに対してデータの書き込み(`XADD`)を行い、HTTP `200 OK` を返す。
 
 ### 3.3 Consul (Service Registry / Discovery)
 * **役割:** システム内のすべてのサービスの「電話帳」および「健康管理者」として機能する。
 * **動作:** 各コンポーネントからのサービス登録を受け付ける。定期的なヘルスチェックを行い、異常のあるノードをルーティングの対象から自動的に除外する。
 
 ### 3.4 Redis + Redis Sentinel (In-Memory Data Store)
-* **役割:** APIサーバーの応答速度を担保するための高速なメッセージキュー（バッファ）として機能する。
-* **動作:** Redis Streamsデータ構造を利用し、時系列データを一時的に保持。Sentinelによってマスターノードのダウンを監視し、自動フェイルオーバー（レプリカの昇格）を行うことで高可用性(HA)を担保する。
+* **役割:** APIサーバーの応答速度を担保するための高速なメッセージキュー（バッファ）およびホストの状態管理データベースとして機能する。
+* **動作:** Redis Streamsデータ構造を利用し、時系列データを一時的に保持。Sentinelによってマスターノードのダウンを監視し、自動フェイルオーバーを行う。また、ハッシュ `state:hosts` にてホストごとの監視状態（正常/異常）を保持する。
 
 ### 3.5 MongoDB (Persistent Storage)
-* **役割:** 収集されたメトリクスデータの最終的な保存先。
-* **動作:** 時系列データの保存に適したドキュメント指向データベースとして機能。GoのWorkerからのBulk Insertを受け付け、将来的なデータ集計やダッシュボード表示の基盤となる。
+* **役割:** 収集されたメトリクスデータの最終的な保存先、および設定データの永続化先。
+* **動作:** GoのWorkerからのBulk Insertを受け付けるほか、Config Manager からのテナントごとの閾値設定（`configs` コレクション）を永続化する。
 
-## 4. データフロー（正常系）
+### 3.6 Config Manager (Go Application) [NEW]
+* **役割:** 各コンポーネントの設定（Analyzer の閾値設定など）を一元管理するAPIサーバー。
+* **動作:** テナント別の閾値設定を受け付ける REST API (`/api/v1/config/analyzer/{tenant_id}`) を提供し、設定情報を MongoDB に保存・取得する。自身を Consul に登録して他コンポーネントから発見可能にする。
 
-1.  **エージェント起動:** ConsulへAPIサーバーのアドレスを問い合わせる。
-2.  **データ収集:** エージェントが自身のCPU/メモリ使用率を取得。
-3.  **データ送信:** エージェントがAPIサーバーへJSONペイロードを送信。
-4.  **キューイング:** APIサーバーがデータを受け取り、Redis Streamに非同期で追加。即座にエージェントへレスポンスを返す。
-5.  **データ取り出し:** バックグラウンドのWorkerがRedisからまとまった単位でデータを取得。
-6.  **永続化:** WorkerがMongoDBに対してまとめてInsert処理を行う。
-7.  **処理完了通知:** MongoDBへの保存成功後、WorkerがRedisに対して処理完了(ACK)を通知し、キューからタスクを消化する。
+### 3.7 Analyzer (Go Application) [NEW]
+* **役割:** 収集されたメトリクスをリアルタイムに解析し、閾値超過を検知して通知する。
+* **動作:** Redis Streams からデータを Pull し、該当テナントの設定を Config Manager から取得（メモリキャッシュ併用）。前回の状態と今回の状態を比較し、正常 ⇄ 異常の遷移（ヒステリシスを考慮）が発生した時のみログ通知を出力し、最新状態を Redis (`state:hosts`) に保存する。
+
+## 4. データフロー（正常系および設定・解析）
+
+### 4.1 設定登録フロー
+1.  **設定送信:** 管理者が Config Manager に対して特定のテナントの設定（エラー閾値・復帰閾値）を送信。
+2.  **設定保存:** Config Manager が MongoDB に対して設定をアップサートする。
+
+### 4.2 監視・解析データフロー
+1.  **エージェント起動:** Consul を介して API サーバーのアドレスを解決する。環境変数からテナントIDを読み込む。
+2.  **データ送信:** エージェントが自身のCPU/メモリ使用率を収集し、テナントIDとともに API サーバーへ JSON を POST 送信。
+3.  **キューイング:** API サーバーがデータを受け取り、即座に Redis Streams (`metrics_stream`) に追加して HTTP 200 を返す。
+4.  **解析データ取得:** Analyzer が Redis Streams から `XREADGROUP` で未処理のメトリクスを Pull する。
+5.  **設定同期:** Analyzer が該当テナントの設定を Config Manager から取得（10秒キャッシュ）。
+6.  **状態判定:** 設定された閾値とメトリクスを比較し、状態遷移（正常 ⇄ 異常）を判定する。
+7.  **通知・記録:** 状態遷移が発生した場合、コンソールログに通知を出力し、新しい状態を Redis の `state:hosts` に保存する。
+8.  **処理完了:** 処理完了後、Analyzer が Redis に対して処理完了(ACK)を通知する。

@@ -83,17 +83,73 @@ services:
     depends_on:
       - consul
       - redis-sentinel
+
+  configmanager:
+    build:
+      context: ../
+      dockerfile: deployments/Dockerfile.configmanager
+    container_name: configmanager
+    networks:
+      - watch-net
+    restart: always
+    ports:
+      - "8081:8081"
+    environment:
+      - CONSUL_ADDR=consul:8500
+      - MONGO_URI=mongodb://mongodb:27017
+      - CONFIG_MANAGER_PORT=8081
+      - CONFIG_MANAGER_HOST=configmanager
+    depends_on:
+      - consul
+      - mongodb
+
+  analyzer:
+    build:
+      context: ../
+      dockerfile: deployments/Dockerfile.analyzer
+    container_name: analyzer
+    networks:
+      - watch-net
+    restart: always
+    environment:
+      - CONSUL_ADDR=consul:8500
+      - REDIS_SENTINEL_ADDR=redis-sentinel:26379
+      - REDIS_MASTER_NAME=mymaster
+    depends_on:
+      - consul
+      - redis-sentinel
+      - configmanager
   
-  agent:
+  agent-tenant-1:
     build:
       context: ..
       dockerfile: deployments/Dockerfile.agent
-    container_name: agent
+    container_name: agent-tenant-1
     networks:
       - watch-net
+    restart: always
     environment:
       - CONSUL_ADDR=consul:8500
       - COLLECT_INTERVAL=5s
+      - TENANT_ID=tenant-1
+    depends_on:
+      - consul
+      - apiserver
+    # ★重要: コンテナの中からホストマシンのリソース（CPU/メモリ）を取得するための設定
+    pid: "host"
+
+  agent-tenant-2:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.agent
+    container_name: agent-tenant-2
+    networks:
+      - watch-net
+    restart: always
+    environment:
+      - CONSUL_ADDR=consul:8500
+      - COLLECT_INTERVAL=5s
+      - TENANT_ID=tenant-2
     depends_on:
       - consul
       - apiserver

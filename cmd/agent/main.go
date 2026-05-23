@@ -15,6 +15,7 @@ import (
 )
 
 type MetricPayload struct {
+	TenantID    string  `json:"tenant_id"`
 	HostID      string  `json:"host_id"`
 	CPUUsage    float64 `json:"cpu_usage"`
 	MemoryUsage float64 `json:"memory_usage"`
@@ -34,6 +35,7 @@ func main() {
 	}
 
 	consulAddr := getEnv("CONSUL_ADDR", "http://localhost:8500")
+	tenantID := getEnv("TENANT_ID", "default-tenant")
 	intervalStr := getEnv("COLLECT_INTERVAL", "5s")
 	interval, err := time.ParseDuration(intervalStr)
 
@@ -41,7 +43,7 @@ func main() {
 		interval = 5 * time.Second
 	}
 
-	log.Printf("エージェントを起動しました [Host: %s, Interval: %s]", hostID, interval)
+	log.Printf("エージェントを起動しました [Tenant: %s, Host: %s, Interval: %s]", tenantID, hostID, interval)
 
 	// 1. Consulクライアントの初期化
 	consulConfig := api.DefaultConfig()
@@ -54,6 +56,7 @@ func main() {
 	// 永久ループで定期的にメトリクスを収集・送信
 	for {
 		payload := collectMetrics(hostID)
+		payload.TenantID = tenantID
 
 		// 2. サービスディスカバリ　(Consulに健全なAPIサーバの場所を聞く)
 		apiURL, err := discoverAPIServer(consulClient)
