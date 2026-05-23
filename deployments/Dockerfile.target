@@ -1,0 +1,6 @@
+FROM alpine:latest
+
+# iptables と ca-certificates をあらかじめインストール
+RUN apk add --no-cache iptables ca-certificates
+
+CMD ["tail", "-f", "/dev/null"]

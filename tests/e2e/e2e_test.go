@@ -16,18 +16,30 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+type PingResult struct {
+	Target   string `json:"target"`
+	Sent     int    `json:"sent"`
+	Received int    `json:"received"`
+}
+
 type AnalyzerConfig struct {
 	CPUErrorThreshold       float64 `json:"cpu_error_threshold" bson:"cpu_error_threshold"`
 	CPURecoveryThreshold    float64 `json:"cpu_recovery_threshold" bson:"cpu_recovery_threshold"`
 	MemoryErrorThreshold    float64 `json:"memory_error_threshold" bson:"memory_error_threshold"`
 	MemoryRecoveryThreshold float64 `json:"memory_recovery_threshold" bson:"memory_recovery_threshold"`
+	PingCount               int     `json:"ping_count" bson:"ping_count"`
+	PingIntervalMS          int     `json:"ping_interval_ms" bson:"ping_interval_ms"`
+	PingTimeoutMS           int     `json:"ping_timeout_ms" bson:"ping_timeout_ms"`
+	CollectIntervalSeconds  int     `json:"collect_interval_seconds" bson:"collect_interval_seconds"`
+	PingErrorLostThreshold  int     `json:"ping_error_lost_threshold" bson:"ping_error_lost_threshold"`
 }
 
 type MetricPayload struct {
-	TenantID    string  `json:"tenant_id"`
-	HostID      string  `json:"host_id"`
-	CPUUsage    float64 `json:"cpu_usage"`
-	MemoryUsage float64 `json:"memory_usage"`
+	TenantID    string       `json:"tenant_id"`
+	HostID      string       `json:"host_id"`
+	CPUUsage    float64      `json:"cpu_usage"`
+	MemoryUsage float64      `json:"memory_usage"`
+	PingResults []PingResult `json:"ping_results"`
 }
 
 type ConfigDocument struct {
@@ -56,7 +68,7 @@ func TestE2EWatchSystem(t *testing.T) {
 	defer mongoClient.Disconnect(ctx)
 	configCollection := mongoClient.Database("watch_system").Collection("configs")
 
-	// Redis (テストホストから直接接続するため、ポートマッピングされた 6379 に接続)
+	// Redis
 	rdb := redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
 	})
@@ -93,6 +105,9 @@ func TestE2EWatchSystem(t *testing.T) {
 	if config.CPUErrorThreshold != 80.0 {
 		t.Fatalf("期待されるデフォルトCPUエラー閾値は 80.0, 実際は: %.1f", config.CPUErrorThreshold)
 	}
+	if config.PingCount != 5 {
+		t.Fatalf("期待されるデフォルトPing送信数は 5, 実際は: %d", config.PingCount)
+	}
 
 	// ==========================================
 	// ステップ2: 閾値設定の登録 (POST) と MongoDB 反映確認
@@ -103,6 +118,11 @@ func TestE2EWatchSystem(t *testing.T) {
 		CPURecoveryThreshold:    10.0,
 		MemoryErrorThreshold:    80.0,
 		MemoryRecoveryThreshold: 70.0,
+		PingCount:               5,
+		PingIntervalMS:          1000,
+		PingTimeoutMS:           1000,
+		CollectIntervalSeconds:  5,
+		PingErrorLostThreshold:  3,
 	}
 	newConfigJSON, _ := json.Marshal(newConfig)
 	
@@ -138,6 +158,9 @@ func TestE2EWatchSystem(t *testing.T) {
 		HostID:      hostID,
 		CPUUsage:    20.0, // CPUErrorThreshold (15.0) を超える値 (Alert想定)
 		MemoryUsage: 50.0,
+		PingResults: []PingResult{
+			{Target: "target-host-1", Sent: 5, Received: 5}, // 正常
+		},
 	}
 	payloadJSON, _ := json.Marshal(payload)
 	
@@ -201,6 +224,9 @@ func TestE2EWatchSystem(t *testing.T) {
 		HostID:      hostID,
 		CPUUsage:    5.0, // CPURecoveryThreshold (10.0) 未満の値 (Recovery想定)
 		MemoryUsage: 50.0,
+		PingResults: []PingResult{
+			{Target: "target-host-1", Sent: 5, Received: 5}, // 正常
+		},
 	}
 	recoveryJSON, _ := json.Marshal(recoveryPayload)
 	
@@ -245,6 +271,11 @@ func TestE2EConfigValidation(t *testing.T) {
 		CPURecoveryThreshold:    15.0, // エラー閾値より高い (無効)
 		MemoryErrorThreshold:    80.0,
 		MemoryRecoveryThreshold: 70.0,
+		PingCount:               5,
+		PingIntervalMS:          1000,
+		PingTimeoutMS:           1000,
+		CollectIntervalSeconds:  5,
+		PingErrorLostThreshold:  3,
 	}
 	invalidJSON, _ := json.Marshal(invalidConfig)
 

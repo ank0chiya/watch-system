@@ -15,11 +15,18 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+type PingResult struct {
+	Target   string `json:"target"`
+	Sent     int    `json:"sent"`
+	Received int    `json:"received"`
+}
+
 type MetricPayload struct {
-	TenantID    string  `json:"tenant_id"`
-	HostID      string  `json:"host_id"`
-	CPUUsage    float64 `json:"cpu_usage"`
-	MemoryUsage float64 `json:"memory_usage"`
+	TenantID    string       `json:"tenant_id"`
+	HostID      string       `json:"host_id"`
+	CPUUsage    float64      `json:"cpu_usage"`
+	MemoryUsage float64      `json:"memory_usage"`
+	PingResults []PingResult `json:"ping_results"`
 }
 
 var rdb *redis.Client

@@ -23,6 +23,11 @@ type AnalyzerConfig struct {
 	CPURecoveryThreshold    float64 `json:"cpu_recovery_threshold" bson:"cpu_recovery_threshold"`
 	MemoryErrorThreshold    float64 `json:"memory_error_threshold" bson:"memory_error_threshold"`
 	MemoryRecoveryThreshold float64 `json:"memory_recovery_threshold" bson:"memory_recovery_threshold"`
+	PingCount               int     `json:"ping_count" bson:"ping_count"`
+	PingIntervalMS          int     `json:"ping_interval_ms" bson:"ping_interval_ms"`
+	PingTimeoutMS           int     `json:"ping_timeout_ms" bson:"ping_timeout_ms"`
+	CollectIntervalSeconds  int     `json:"collect_interval_seconds" bson:"collect_interval_seconds"`
+	PingErrorLostThreshold  int     `json:"ping_error_lost_threshold" bson:"ping_error_lost_threshold"`
 }
 
 // ConfigDocument は MongoDB に保存するドキュメント構造体です
@@ -157,7 +162,80 @@ func getDefaultConfig() AnalyzerConfig {
 		CPURecoveryThreshold:    70.0,
 		MemoryErrorThreshold:    80.0,
 		MemoryRecoveryThreshold: 70.0,
+		PingCount:               5,
+		PingIntervalMS:          1000,
+		PingTimeoutMS:           1000,
+		CollectIntervalSeconds:  5,
+		PingErrorLostThreshold:  3,
 	}
+}
+
+// validateConfig は設定パラメータの整合性を検証します
+func validateConfig(config AnalyzerConfig) error {
+	if config.CPUErrorThreshold <= 0 || config.CPUErrorThreshold > 100 ||
+		config.CPURecoveryThreshold <= 0 || config.CPURecoveryThreshold > 100 ||
+		config.MemoryErrorThreshold <= 0 || config.MemoryErrorThreshold > 100 ||
+		config.MemoryRecoveryThreshold <= 0 || config.MemoryRecoveryThreshold > 100 {
+		return fmt.Errorf("thresholds must be between 0 and 100")
+	}
+
+	if config.CPURecoveryThreshold >= config.CPUErrorThreshold {
+		return fmt.Errorf("CPU recovery threshold must be less than error threshold")
+	}
+	if config.MemoryRecoveryThreshold >= config.MemoryErrorThreshold {
+		return fmt.Errorf("Memory recovery threshold must be less than error threshold")
+	}
+
+	// Ping関連のバリデーション
+	if config.PingCount < 1 || config.PingCount > 20 {
+		return fmt.Errorf("ping_count must be between 1 and 20")
+	}
+	if config.PingIntervalMS < 100 || config.PingIntervalMS > 5000 {
+		return fmt.Errorf("ping_interval_ms must be between 100 and 5000")
+	}
+	if config.PingTimeoutMS < 100 || config.PingTimeoutMS > 5000 {
+		return fmt.Errorf("ping_timeout_ms must be between 100 and 5000")
+	}
+	if config.CollectIntervalSeconds < 2 || config.CollectIntervalSeconds > 300 {
+		return fmt.Errorf("collect_interval_seconds must be between 2 and 300")
+	}
+	if config.PingErrorLostThreshold < 1 || config.PingErrorLostThreshold > config.PingCount {
+		return fmt.Errorf("ping_error_lost_threshold must be between 1 and ping_count")
+	}
+
+	return nil
+}
+
+func mergeWithDefaults(c AnalyzerConfig) AnalyzerConfig {
+	defaultConf := getDefaultConfig()
+	if c.CPUErrorThreshold == 0 {
+		c.CPUErrorThreshold = defaultConf.CPUErrorThreshold
+	}
+	if c.CPURecoveryThreshold == 0 {
+		c.CPURecoveryThreshold = defaultConf.CPURecoveryThreshold
+	}
+	if c.MemoryErrorThreshold == 0 {
+		c.MemoryErrorThreshold = defaultConf.MemoryErrorThreshold
+	}
+	if c.MemoryRecoveryThreshold == 0 {
+		c.MemoryRecoveryThreshold = defaultConf.MemoryRecoveryThreshold
+	}
+	if c.PingCount == 0 {
+		c.PingCount = defaultConf.PingCount
+	}
+	if c.PingIntervalMS == 0 {
+		c.PingIntervalMS = defaultConf.PingIntervalMS
+	}
+	if c.PingTimeoutMS == 0 {
+		c.PingTimeoutMS = defaultConf.PingTimeoutMS
+	}
+	if c.CollectIntervalSeconds == 0 {
+		c.CollectIntervalSeconds = defaultConf.CollectIntervalSeconds
+	}
+	if c.PingErrorLostThreshold == 0 {
+		c.PingErrorLostThreshold = defaultConf.PingErrorLostThreshold
+	}
+	return c
 }
 
 func handleGetConfig(w http.ResponseWriter, r *http.Request) {
@@ -186,8 +264,9 @@ func handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mergedConf := mergeWithDefaults(doc.Config)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(doc.Config)
+	json.NewEncoder(w).Encode(mergedConf)
 }
 
 func handlePostConfig(w http.ResponseWriter, r *http.Request) {
@@ -203,21 +282,9 @@ func handlePostConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 簡易バリデーション
-	if reqConfig.CPUErrorThreshold <= 0 || reqConfig.CPUErrorThreshold > 100 ||
-		reqConfig.CPURecoveryThreshold <= 0 || reqConfig.CPURecoveryThreshold > 100 ||
-		reqConfig.MemoryErrorThreshold <= 0 || reqConfig.MemoryErrorThreshold > 100 ||
-		reqConfig.MemoryRecoveryThreshold <= 0 || reqConfig.MemoryRecoveryThreshold > 100 {
-		http.Error(w, "Thresholds must be between 0 and 100", http.StatusBadRequest)
-		return
-	}
-	// リカバリ閾値がエラー閾値より高い、または等しい場合はエラーにする（ヒステリシスの整合性）
-	if reqConfig.CPURecoveryThreshold >= reqConfig.CPUErrorThreshold {
-		http.Error(w, "CPU recovery threshold must be less than error threshold", http.StatusBadRequest)
-		return
-	}
-	if reqConfig.MemoryRecoveryThreshold >= reqConfig.MemoryErrorThreshold {
-		http.Error(w, "Memory recovery threshold must be less than error threshold", http.StatusBadRequest)
+	// 設定バリデーションの実行
+	if err := validateConfig(reqConfig); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 

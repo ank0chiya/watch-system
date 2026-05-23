@@ -132,6 +132,7 @@ services:
       - CONSUL_ADDR=consul:8500
       - COLLECT_INTERVAL=5s
       - TENANT_ID=tenant-1
+      - PING_TARGETS=target-host-1
     depends_on:
       - consul
       - apiserver
@@ -150,11 +151,34 @@ services:
       - CONSUL_ADDR=consul:8500
       - COLLECT_INTERVAL=5s
       - TENANT_ID=tenant-2
+      - PING_TARGETS=target-host-2
     depends_on:
       - consul
       - apiserver
     # ★重要: コンテナの中からホストマシンのリソース（CPU/メモリ）を取得するための設定
     pid: "host"
+
+  target-host-1:
+    build:
+      context: ../
+      dockerfile: deployments/Dockerfile.target
+    container_name: target-host-1
+    networks:
+      - watch-net
+    cap_add:
+      - NET_ADMIN
+    restart: always
+
+  target-host-2:
+    build:
+      context: ../
+      dockerfile: deployments/Dockerfile.target
+    container_name: target-host-2
+    networks:
+      - watch-net
+    cap_add:
+      - NET_ADMIN
+    restart: always
 
 volumes:
   consul_data:

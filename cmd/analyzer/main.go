@@ -16,12 +16,19 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+type PingResult struct {
+	Target   string `json:"target"`
+	Sent     int    `json:"sent"`
+	Received int    `json:"received"`
+}
+
 // MetricPayload は受信するメトリクス構造体です
 type MetricPayload struct {
-	TenantID    string  `json:"tenant_id"`
-	HostID      string  `json:"host_id"`
-	CPUUsage    float64 `json:"cpu_usage"`
-	MemoryUsage float64 `json:"memory_usage"`
+	TenantID    string       `json:"tenant_id"`
+	HostID      string       `json:"host_id"`
+	CPUUsage    float64      `json:"cpu_usage"`
+	MemoryUsage float64      `json:"memory_usage"`
+	PingResults []PingResult `json:"ping_results"`
 }
 
 // AnalyzerConfig は閾値設定構造体です
@@ -30,6 +37,11 @@ type AnalyzerConfig struct {
 	CPURecoveryThreshold    float64 `json:"cpu_recovery_threshold"`
 	MemoryErrorThreshold    float64 `json:"memory_error_threshold"`
 	MemoryRecoveryThreshold float64 `json:"memory_recovery_threshold"`
+	PingCount               int     `json:"ping_count"`
+	PingIntervalMS          int     `json:"ping_interval_ms"`
+	PingTimeoutMS           int     `json:"ping_timeout_ms"`
+	CollectIntervalSeconds  int     `json:"collect_interval_seconds"`
+	PingErrorLostThreshold  int     `json:"ping_error_lost_threshold"`
 }
 
 // CachedConfig はキャッシュ用の構造体です
@@ -40,50 +52,69 @@ type CachedConfig struct {
 
 // Notifier は通知を行うインターフェースです
 type Notifier interface {
-	NotifyAlert(tenantID, hostID string, cpu, mem float64, conf AnalyzerConfig)
-	NotifyRecovery(tenantID, hostID string, cpu, mem float64, conf AnalyzerConfig)
+	NotifyAlert(tenantID, hostID string, payload MetricPayload, conf AnalyzerConfig)
+	NotifyRecovery(tenantID, hostID string, payload MetricPayload, conf AnalyzerConfig)
 }
 
 // LogNotifier はコンソールに通知を出力する実装です
 type LogNotifier struct{}
 
-func (n *LogNotifier) NotifyAlert(tenantID, hostID string, cpu, mem float64, conf AnalyzerConfig) {
+func (n *LogNotifier) NotifyAlert(tenantID, hostID string, payload MetricPayload, conf AnalyzerConfig) {
+	pingDetails := ""
+	for _, p := range payload.PingResults {
+		pingDetails += fmt.Sprintf("\n- Ping Target: %s, Sent: %d, Received: %d (Lost: %d, Threshold: %d)",
+			p.Target, p.Sent, p.Received, p.Sent-p.Received, conf.PingErrorLostThreshold)
+	}
+
 	log.Printf(`
 **************************************************
 [ALERT] 異常状態を検知しました！
 - テナント: %s
 - ホスト: %s
 - CPU使用率: %.1f%% (閾値: %.1f%%)
-- メモリ使用率: %.1f%% (閾値: %.1f%%)
+- メモリ使用率: %.1f%% (閾値: %.1f%%)%s
 - 検知時刻: %s
 **************************************************`,
-		tenantID, hostID, cpu, conf.CPUErrorThreshold, mem, conf.MemoryErrorThreshold, time.Now().Format("2006-01-02 15:04:05"))
+		tenantID, hostID, payload.CPUUsage, conf.CPUErrorThreshold, payload.MemoryUsage, conf.MemoryErrorThreshold,
+		pingDetails, time.Now().Format("2006-01-02 15:04:05"))
 }
 
-func (n *LogNotifier) NotifyRecovery(tenantID, hostID string, cpu, mem float64, conf AnalyzerConfig) {
+func (n *LogNotifier) NotifyRecovery(tenantID, hostID string, payload MetricPayload, conf AnalyzerConfig) {
+	pingDetails := ""
+	for _, p := range payload.PingResults {
+		pingDetails += fmt.Sprintf("\n- Ping Target: %s, Sent: %d, Received: %d (Lost: %d, Threshold: %d)",
+			p.Target, p.Sent, p.Received, p.Sent-p.Received, conf.PingErrorLostThreshold)
+	}
+
 	log.Printf(`
 **************************************************
 [RECOVERY] 通常状態に復帰しました。
 - テナント: %s
 - ホスト: %s
 - CPU使用率: %.1f%% (復帰基準: < %.1f%%)
-- メモリ使用率: %.1f%% (復帰基準: < %.1f%%)
+- メモリ使用率: %.1f%% (復帰基準: < %.1f%%)%s
 - 復帰時刻: %s
 **************************************************`,
-		tenantID, hostID, cpu, conf.CPURecoveryThreshold, mem, conf.MemoryRecoveryThreshold, time.Now().Format("2006-01-02 15:04:05"))
+		tenantID, hostID, payload.CPUUsage, conf.CPURecoveryThreshold, payload.MemoryUsage, conf.MemoryRecoveryThreshold,
+		pingDetails, time.Now().Format("2006-01-02 15:04:05"))
 }
 
 var (
-	rdb             *redis.Client
-	consulClient    *api.Client
-	configCache     = make(map[string]CachedConfig)
-	configCacheMu   sync.RWMutex
-	cacheTTL        = 10 * time.Second
-	defaultConfig   = AnalyzerConfig{
+	rdb           *redis.Client
+	consulClient  *api.Client
+	configCache   = make(map[string]CachedConfig)
+	configCacheMu sync.RWMutex
+	cacheTTL      = 10 * time.Second
+	defaultConfig = AnalyzerConfig{
 		CPUErrorThreshold:       80.0,
 		CPURecoveryThreshold:    70.0,
 		MemoryErrorThreshold:    80.0,
 		MemoryRecoveryThreshold: 70.0,
+		PingCount:               5,
+		PingIntervalMS:          1000,
+		PingTimeoutMS:           1000,
+		CollectIntervalSeconds:  5,
+		PingErrorLostThreshold:  3,
 	}
 )
 
@@ -127,10 +158,8 @@ func main() {
 	log.Println("Redis Sentinel接続に成功しました")
 
 	// Redis Stream グループ作成 (存在しない場合は作成)
-	// XGroupCreateMkStream は Stream 自体がなくても自動作成します
 	err = rdb.XGroupCreateMkStream(context.Background(), "metrics_stream", "metrics_group", "0").Err()
 	if err != nil {
-		// すでにグループが存在する場合は BUSYGROUP エラーが返るので無視する
 		log.Printf("XGroupCreateMkStream 情報 (エラーではない可能性があります): %v", err)
 	}
 
@@ -162,7 +191,6 @@ func startAnalysisLoop(notifier Notifier, stopChan chan struct{}) {
 		case <-stopChan:
 			return
 		default:
-			// Redis Stream からデータを Pull (2秒ブロック)
 			ctx := context.Background()
 			streams, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 				Group:    "metrics_group",
@@ -175,7 +203,7 @@ func startAnalysisLoop(notifier Notifier, stopChan chan struct{}) {
 			if err != nil {
 				if err != redis.Nil {
 					log.Printf("Redis Streamの読み取りエラー: %v", err)
-					time.Sleep(1 * time.Second) // エラー時は少し待機
+					time.Sleep(1 * time.Second)
 				}
 				continue
 			}
@@ -211,7 +239,6 @@ func processMessage(ctx context.Context, msg redis.XMessage, notifier Notifier) 
 	stateKey := "state:hosts"
 	fieldKey := fmt.Sprintf("%s:%s", payload.TenantID, payload.HostID)
 	
-	// 初期状態は "Normal" とする
 	lastState, err := rdb.HGet(ctx, stateKey, fieldKey).Result()
 	if err == redis.Nil {
 		lastState = "Normal"
@@ -220,27 +247,15 @@ func processMessage(ctx context.Context, msg redis.XMessage, notifier Notifier) 
 		return
 	}
 
-	// 3. 状態の判定 (ヒステリシスロジック)
-	newState := lastState
-
-	// エラー判定: CPU または メモリがエラー閾値以上
-	isError := payload.CPUUsage >= conf.CPUErrorThreshold || payload.MemoryUsage >= conf.MemoryErrorThreshold
-	// 復帰判定: CPU と メモリが両方リカバリ閾値未満
-	isRecovery := payload.CPUUsage < conf.CPURecoveryThreshold && payload.MemoryUsage < conf.MemoryRecoveryThreshold
-
-	if isError {
-		newState = "Alert"
-	} else if isRecovery {
-		newState = "Normal"
-	}
-	// 中間域の場合は newState = lastState のまま（変化なし）
+	// 3. 状態の判定 (evaluateState の呼び出し)
+	newState := evaluateState(payload, conf, lastState)
 
 	// 4. 状態遷移の検知および通知
 	if newState != lastState {
 		if newState == "Alert" {
-			notifier.NotifyAlert(payload.TenantID, payload.HostID, payload.CPUUsage, payload.MemoryUsage, conf)
+			notifier.NotifyAlert(payload.TenantID, payload.HostID, payload, conf)
 		} else if newState == "Normal" {
-			notifier.NotifyRecovery(payload.TenantID, payload.HostID, payload.CPUUsage, payload.MemoryUsage, conf)
+			notifier.NotifyRecovery(payload.TenantID, payload.HostID, payload, conf)
 		}
 
 		// Redis の状態を更新
@@ -253,6 +268,46 @@ func processMessage(ctx context.Context, msg redis.XMessage, notifier Notifier) 
 	rdb.XAck(ctx, "metrics_stream", "metrics_group", msg.ID)
 }
 
+// evaluateState は、現在のメトリクス、設定値、および前回状態をもとに、新しい状態を評価します (単体テスト可能)
+func evaluateState(payload MetricPayload, conf AnalyzerConfig, lastState string) string {
+	// 1. リソースエラー判定
+	isResourceError := payload.CPUUsage >= conf.CPUErrorThreshold || payload.MemoryUsage >= conf.MemoryErrorThreshold
+
+	// 2. Pingエラー判定 (しきい値以上のパケットロストが1つでもあるか)
+	isPingError := false
+	for _, p := range payload.PingResults {
+		lost := p.Sent - p.Received
+		if lost >= conf.PingErrorLostThreshold {
+			isPingError = true
+			break
+		}
+	}
+
+	isError := isResourceError || isPingError
+
+	// 3. 復帰判定 (リソースがすべて復帰値未満かつ、すべてのPingのロスト数がしきい値未満)
+	isResourceRecovery := payload.CPUUsage < conf.CPURecoveryThreshold && payload.MemoryUsage < conf.MemoryRecoveryThreshold
+	isPingRecovery := true
+	for _, p := range payload.PingResults {
+		lost := p.Sent - p.Received
+		if lost >= conf.PingErrorLostThreshold {
+			isPingRecovery = false
+			break
+		}
+	}
+
+	isRecovery := isResourceRecovery && isPingRecovery
+
+	if isError {
+		return "Alert"
+	} else if isRecovery {
+		return "Normal"
+	}
+
+	// 中間領域にいる場合は状態維持
+	return lastState
+}
+
 func getTenantConfig(tenantID string) AnalyzerConfig {
 	if tenantID == "" {
 		return defaultConfig
@@ -261,16 +316,13 @@ func getTenantConfig(tenantID string) AnalyzerConfig {
 	cached, found := configCache[tenantID]
 	configCacheMu.RUnlock()
 
-	// キャッシュが有効な場合はそのまま返す
 	if found && time.Since(cached.FetchedAt) < cacheTTL {
 		return cached.Config
 	}
 
-	// キャッシュが無効または見つからない場合は Config Manager から取得を試みる
 	configCacheMu.Lock()
 	defer configCacheMu.Unlock()
 
-	// Lock獲得の間に他スレッドが更新した可能性を再確認
 	cached, found = configCache[tenantID]
 	if found && time.Since(cached.FetchedAt) < cacheTTL {
 		return cached.Config
@@ -279,7 +331,6 @@ func getTenantConfig(tenantID string) AnalyzerConfig {
 	config, err := fetchConfigFromManager(tenantID)
 	if err != nil {
 		log.Printf("警告: Config Manager からの設定取得に失敗しました (デフォルト設定を適用します): %v", err)
-		// 失敗した場合はキャッシュにデフォルトを入れつつ、エラーリトライのため短いFetchedAtを設定する
 		config = defaultConfig
 	}
 
@@ -291,8 +342,38 @@ func getTenantConfig(tenantID string) AnalyzerConfig {
 	return config
 }
 
+func mergeWithDefaults(c AnalyzerConfig) AnalyzerConfig {
+	if c.CPUErrorThreshold == 0 {
+		c.CPUErrorThreshold = defaultConfig.CPUErrorThreshold
+	}
+	if c.CPURecoveryThreshold == 0 {
+		c.CPURecoveryThreshold = defaultConfig.CPURecoveryThreshold
+	}
+	if c.MemoryErrorThreshold == 0 {
+		c.MemoryErrorThreshold = defaultConfig.MemoryErrorThreshold
+	}
+	if c.MemoryRecoveryThreshold == 0 {
+		c.MemoryRecoveryThreshold = defaultConfig.MemoryRecoveryThreshold
+	}
+	if c.PingCount == 0 {
+		c.PingCount = defaultConfig.PingCount
+	}
+	if c.PingIntervalMS == 0 {
+		c.PingIntervalMS = defaultConfig.PingIntervalMS
+	}
+	if c.PingTimeoutMS == 0 {
+		c.PingTimeoutMS = defaultConfig.PingTimeoutMS
+	}
+	if c.CollectIntervalSeconds == 0 {
+		c.CollectIntervalSeconds = defaultConfig.CollectIntervalSeconds
+	}
+	if c.PingErrorLostThreshold == 0 {
+		c.PingErrorLostThreshold = defaultConfig.PingErrorLostThreshold
+	}
+	return c
+}
+
 func fetchConfigFromManager(tenantID string) (AnalyzerConfig, error) {
-	// Consulからconfigmanagerサービスのアドレスを解決
 	services, _, err := consulClient.Health().Service("configmanager", "", true, nil)
 	if err != nil || len(services) == 0 {
 		return defaultConfig, fmt.Errorf("健全な configmanager サービスが見つかりません: %v", err)
@@ -317,5 +398,5 @@ func fetchConfigFromManager(tenantID string) (AnalyzerConfig, error) {
 		return defaultConfig, err
 	}
 
-	return conf, nil
+	return mergeWithDefaults(conf), nil
 }
